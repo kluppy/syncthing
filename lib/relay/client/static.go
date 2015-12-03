@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/dialer"
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
@@ -22,7 +23,8 @@ type staticClient struct {
 
 	config *tls.Config
 
-	timeout time.Duration
+	messageTimeout time.Duration
+	connectTimeout time.Duration
 
 	stop    chan struct{}
 	stopped chan struct{}
@@ -34,7 +36,7 @@ type staticClient struct {
 	latency   time.Duration
 }
 
-func newStaticClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation) RelayClient {
+func newStaticClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) RelayClient {
 	closeInvitationsOnFinish := false
 	if invitations == nil {
 		closeInvitationsOnFinish = true
@@ -49,7 +51,8 @@ func newStaticClient(uri *url.URL, certs []tls.Certificate, invitations chan pro
 
 		config: configForCerts(certs),
 
-		timeout: time.Minute * 2,
+		messageTimeout: time.Minute * 2,
+		connectTimeout: timeout,
 
 		stop:    make(chan struct{}),
 		stopped: make(chan struct{}),
@@ -95,12 +98,12 @@ func (c *staticClient) Serve() {
 
 	go messageReader(c.conn, messages, errors)
 
-	timeout := time.NewTimer(c.timeout)
+	timeout := time.NewTimer(c.messageTimeout)
 
 	for {
 		select {
 		case message := <-messages:
-			timeout.Reset(c.timeout)
+			timeout.Reset(c.messageTimeout)
 			l.Debugf("%s received message %T", c, message)
 
 			switch msg := message.(type) {
@@ -118,6 +121,10 @@ func (c *staticClient) Serve() {
 					msg.Address = c.conn.RemoteAddr().(*net.TCPAddr).IP[:]
 				}
 				c.invitations <- msg
+
+			case protocol.RelayFull:
+				l.Infoln("Disconnected from relay due to it becoming full.")
+				return
 
 			default:
 				l.Infoln("Relay: protocol error: unexpected message %v", msg)
@@ -183,7 +190,7 @@ func (c *staticClient) connect() error {
 	}
 
 	t0 := time.Now()
-	tcpConn, err := net.Dial("tcp", c.uri.Host)
+	tcpConn, err := dialer.DialTimeout("tcp", c.uri.Host, c.connectTimeout)
 	if err != nil {
 		return err
 	}
@@ -197,7 +204,7 @@ func (c *staticClient) connect() error {
 		return err
 	}
 
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(c.connectTimeout)); err != nil {
 		conn.Close()
 		return err
 	}
@@ -239,6 +246,9 @@ func (c *staticClient) join() error {
 		if msg.Code != 0 {
 			return fmt.Errorf("Incorrect response code %d: %s", msg.Code, msg.Message)
 		}
+
+	case protocol.RelayFull:
+		return fmt.Errorf("relay full")
 
 	default:
 		return fmt.Errorf("protocol error: expecting response got %v", msg)

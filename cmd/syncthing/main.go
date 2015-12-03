@@ -70,7 +70,8 @@ const (
 const (
 	bepProtocolName      = "bep/1.0"
 	tlsDefaultCommonName = "syncthing"
-	tlsRSABits           = 3072
+	httpsRSABits         = 2048
+	bepRSABits           = 0 // 384 bit ECDSA used instead
 	pingEventInterval    = time.Minute
 	maxSystemErrors      = 5
 	initialSystemLog     = 10
@@ -197,7 +198,6 @@ var (
 	upgradeTo      string
 	noBrowser      bool
 	noConsole      bool
-	generateDir    string
 	logFile        string
 	auditEnabled   bool
 	verbose        bool
@@ -224,6 +224,7 @@ func main() {
 	}
 
 	var guiAddress, guiAPIKey string
+	var generateDir string
 	flag.StringVar(&generateDir, "generate", "", "Generate key and config in specified dir, then exit")
 	flag.StringVar(&guiAddress, "gui-address", guiAddress, "Override GUI address")
 	flag.StringVar(&guiAPIKey, "gui-apikey", guiAPIKey, "Override GUI API key")
@@ -283,54 +284,7 @@ func main() {
 	l.SetFlags(logFlags)
 
 	if generateDir != "" {
-		dir, err := osutil.ExpandTilde(generateDir)
-		if err != nil {
-			l.Fatalln("generate:", err)
-		}
-
-		info, err := os.Stat(dir)
-		if err == nil && !info.IsDir() {
-			l.Fatalln(dir, "is not a directory")
-		}
-		if err != nil && os.IsNotExist(err) {
-			err = osutil.MkdirAll(dir, 0700)
-			if err != nil {
-				l.Fatalln("generate:", err)
-			}
-		}
-
-		certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err == nil {
-			l.Warnln("Key exists; will not overwrite.")
-			l.Infoln("Device ID:", protocol.NewDeviceID(cert.Certificate[0]))
-		} else {
-			cert, err = tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName, tlsRSABits)
-			if err != nil {
-				l.Fatalln("Create certificate:", err)
-			}
-			myID = protocol.NewDeviceID(cert.Certificate[0])
-			if err != nil {
-				l.Fatalln("Load certificate:", err)
-			}
-			if err == nil {
-				l.Infoln("Device ID:", protocol.NewDeviceID(cert.Certificate[0]))
-			}
-		}
-
-		cfgFile := filepath.Join(dir, "config.xml")
-		if _, err := os.Stat(cfgFile); err == nil {
-			l.Warnln("Config exists; will not overwrite.")
-			return
-		}
-		var myName, _ = os.Hostname()
-		var newCfg = defaultConfig(myName)
-		var cfg = config.Wrap(cfgFile, newCfg)
-		err = cfg.Save()
-		if err != nil {
-			l.Warnln("Failed to save config", err)
-		}
-
+		generate(generateDir)
 		return
 	}
 
@@ -399,6 +353,56 @@ func main() {
 		syncthingMain()
 	} else {
 		monitorMain()
+	}
+}
+
+func generate(generateDir string) {
+	dir, err := osutil.ExpandTilde(generateDir)
+	if err != nil {
+		l.Fatalln("generate:", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err == nil && !info.IsDir() {
+		l.Fatalln(dir, "is not a directory")
+	}
+	if err != nil && os.IsNotExist(err) {
+		err = osutil.MkdirAll(dir, 0700)
+		if err != nil {
+			l.Fatalln("generate:", err)
+		}
+	}
+
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err == nil {
+		l.Warnln("Key exists; will not overwrite.")
+		l.Infoln("Device ID:", protocol.NewDeviceID(cert.Certificate[0]))
+	} else {
+		cert, err = tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName, bepRSABits)
+		if err != nil {
+			l.Fatalln("Create certificate:", err)
+		}
+		myID = protocol.NewDeviceID(cert.Certificate[0])
+		if err != nil {
+			l.Fatalln("Load certificate:", err)
+		}
+		if err == nil {
+			l.Infoln("Device ID:", protocol.NewDeviceID(cert.Certificate[0]))
+		}
+	}
+
+	cfgFile := filepath.Join(dir, "config.xml")
+	if _, err := os.Stat(cfgFile); err == nil {
+		l.Warnln("Config exists; will not overwrite.")
+		return
+	}
+	var myName, _ = os.Hostname()
+	var newCfg = defaultConfig(myName)
+	var cfg = config.Wrap(cfgFile, newCfg)
+	err = cfg.Save()
+	if err != nil {
+		l.Warnln("Failed to save config", err)
 	}
 }
 
@@ -498,8 +502,8 @@ func syncthingMain() {
 	// Ensure that that we have a certificate and key.
 	cert, err := tls.LoadX509KeyPair(locations[locCertFile], locations[locKeyFile])
 	if err != nil {
-		l.Infof("Generating RSA key and certificate for %s...", tlsDefaultCommonName)
-		cert, err = tlsutil.NewCertificate(locations[locCertFile], locations[locKeyFile], tlsDefaultCommonName, tlsRSABits)
+		l.Infof("Generating ECDSA key and certificate for %s...", tlsDefaultCommonName)
+		cert, err = tlsutil.NewCertificate(locations[locCertFile], locations[locKeyFile], tlsDefaultCommonName, bepRSABits)
 		if err != nil {
 			l.Fatalln(err)
 		}
@@ -634,6 +638,13 @@ func syncthingMain() {
 			l.Infof("Cleaning data for dropped folder %q", folder)
 			db.DropFolder(ldb, folder)
 		}
+	}
+
+	// Pack and optimize the database
+	if err := ldb.Compact(); err != nil {
+		// I don't think this is fatal, but who knows. If it is, we'll surely
+		// get an error when trying to write to the db later.
+		l.Infoln("Compacting database:", err)
 	}
 
 	m := model.NewModel(cfg, myID, myName, "syncthing", Version, ldb, protectedFiles)
@@ -890,6 +901,10 @@ func setupGUI(mainSvc *suture.Supervisor, cfg *config.Wrapper, m *model.Model, a
 
 	if !guiCfg.Enabled {
 		return
+	}
+
+	if guiCfg.InsecureAdminAccess {
+		l.Warnln("Insecure admin access is enabled.")
 	}
 
 	api, err := newAPISvc(myID, cfg, guiAssets, m, apiSub, discoverer, relaySvc, errors, systemLog)

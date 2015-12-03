@@ -281,6 +281,16 @@ func (p *Process) PostConfig(cfg config.Configuration) error {
 	return err
 }
 
+func (p *Process) PauseDevice(dev protocol.DeviceID) error {
+	_, err := p.Post("/rest/system/pause?device="+dev.String(), nil)
+	return err
+}
+
+func (p *Process) ResumeDevice(dev protocol.DeviceID) error {
+	_, err := p.Post("/rest/system/resume?device="+dev.String(), nil)
+	return err
+}
+
 func InSync(folder string, ps ...*Process) bool {
 	for _, p := range ps {
 		p.eventMut.Lock()
@@ -539,4 +549,28 @@ func (p *Process) eventLoop() {
 			}
 		}
 	}
+}
+
+type ConnectionStats struct {
+	Address       string
+	Type          string
+	Connected     bool
+	Paused        bool
+	ClientVersion string
+	InBytesTotal  int64
+	OutBytesTotal int64
+}
+
+func (p *Process) Connections() (map[string]ConnectionStats, error) {
+	bs, err := p.Get("/rest/system/connections")
+	if err != nil {
+		return nil, err
+	}
+
+	var res map[string]ConnectionStats
+	if err := json.Unmarshal(bs, &res); err != nil {
+		return nil, err
+	}
+
+	return res, nil
 }

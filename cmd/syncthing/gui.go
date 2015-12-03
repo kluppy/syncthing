@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rcrowley/go-metrics"
 	"github.com/syncthing/syncthing/lib/auto"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
@@ -97,7 +98,7 @@ func (s *apiSvc) getListener(guiCfg config.GUIConfiguration) (net.Listener, erro
 			name = tlsDefaultCommonName
 		}
 
-		cert, err = tlsutil.NewCertificate(locations[locHTTPSCertFile], locations[locHTTPSKeyFile], name, tlsRSABits)
+		cert, err = tlsutil.NewCertificate(locations[locHTTPSCertFile], locations[locHTTPSKeyFile], name, httpsRSABits)
 	}
 	if err != nil {
 		return nil, err
@@ -180,10 +181,11 @@ func (s *apiSvc) Serve() {
 
 	// Debug endpoints, not for general use
 	getRestMux.HandleFunc("/rest/debug/peerCompletion", s.getPeerCompletion)
+	getRestMux.HandleFunc("/rest/debug/httpmetrics", s.getSystemHTTPMetrics)
 
 	// A handler that splits requests between the two above and disables
 	// caching
-	restMux := noCacheMiddleware(getPostHandler(getRestMux, postRestMux))
+	restMux := noCacheMiddleware(metricsMiddleware(getPostHandler(getRestMux, postRestMux)))
 
 	// The main routing handler
 	mux := http.NewServeMux()
@@ -298,23 +300,34 @@ func debugMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t0 := time.Now()
 		h.ServeHTTP(w, r)
-		ms := 1000 * time.Since(t0).Seconds()
 
-		// The variable `w` is most likely a *http.response, which we can't do
-		// much with since it's a non exported type. We can however peek into
-		// it with reflection to get at the status code and number of bytes
-		// written.
-		var status, written int64
-		if rw := reflect.Indirect(reflect.ValueOf(w)); rw.IsValid() && rw.Kind() == reflect.Struct {
-			if rf := rw.FieldByName("status"); rf.IsValid() && rf.Kind() == reflect.Int {
-				status = rf.Int()
+		if shouldDebugHTTP() {
+			ms := 1000 * time.Since(t0).Seconds()
+
+			// The variable `w` is most likely a *http.response, which we can't do
+			// much with since it's a non exported type. We can however peek into
+			// it with reflection to get at the status code and number of bytes
+			// written.
+			var status, written int64
+			if rw := reflect.Indirect(reflect.ValueOf(w)); rw.IsValid() && rw.Kind() == reflect.Struct {
+				if rf := rw.FieldByName("status"); rf.IsValid() && rf.Kind() == reflect.Int {
+					status = rf.Int()
+				}
+				if rf := rw.FieldByName("written"); rf.IsValid() && rf.Kind() == reflect.Int64 {
+					written = rf.Int()
+				}
 			}
-			if rf := rw.FieldByName("written"); rf.IsValid() && rf.Kind() == reflect.Int64 {
-				written = rf.Int()
-			}
+			l.Debugf("http: %s %q: status %d, %d bytes in %.02f ms", r.Method, r.URL.String(), status, written, ms)
 		}
+	})
+}
 
-		l.Debugf("http: %s %q: status %d, %d bytes in %.02f ms", r.Method, r.URL.String(), status, written, ms)
+func metricsMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t := metrics.GetOrRegisterTimer(r.URL.Path, nil)
+		t0 := time.Now()
+		h.ServeHTTP(w, r)
+		t.UpdateSince(t0)
 	})
 }
 
@@ -739,6 +752,26 @@ func (s *apiSvc) getSystemLogTxt(w http.ResponseWriter, r *http.Request) {
 	for _, line := range s.systemLog.Since(since) {
 		fmt.Fprintf(w, "%s: %s\n", line.When.Format(time.RFC3339), line.Message)
 	}
+}
+
+func (s *apiSvc) getSystemHTTPMetrics(w http.ResponseWriter, r *http.Request) {
+	stats := make(map[string]interface{})
+	metrics.Each(func(name string, intf interface{}) {
+		if m, ok := intf.(*metrics.StandardTimer); ok {
+			pct := m.Percentiles([]float64{0.50, 0.95, 0.99})
+			for i := range pct {
+				pct[i] /= 1e6 // ns to ms
+			}
+			stats[name] = map[string]interface{}{
+				"count":         m.Count(),
+				"sumMs":         m.Sum() / 1e6, // ns to ms
+				"ratesPerS":     []float64{m.Rate1(), m.Rate5(), m.Rate15()},
+				"percentilesMs": pct,
+			}
+		}
+	})
+	bs, _ := json.MarshalIndent(stats, "", "  ")
+	w.Write(bs)
 }
 
 func (s *apiSvc) getSystemDiscovery(w http.ResponseWriter, r *http.Request) {

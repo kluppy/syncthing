@@ -2,7 +2,7 @@ angular.module('syncthing.core')
     .config(function($locationProvider) {
         $locationProvider.html5Mode(true).hashPrefix('!');
     })
-    .controller('SyncthingController', function ($scope, $http, $location, LocaleService, Events) {
+    .controller('SyncthingController', function ($scope, $http, $location, LocaleService, Events, $filter) {
         'use strict';
 
         // private/helper definitions
@@ -321,7 +321,8 @@ angular.module('syncthing.core')
             var data = arg.data;
             $scope.scanProgress[data.folder] = {
                 current: data.current,
-                total: data.total
+                total: data.total,
+                rate: data.rate,
             };
             console.log("FolderScanProgress", data);
         });
@@ -367,6 +368,15 @@ angular.module('syncthing.core')
                     refreshCompletion(deviceCfg.deviceID, folder);
                 });
             });
+
+            // If we're not listening on localhost, and there is no
+            // authentication configured, and the magic setting to silence the
+            // warning isn't set, then yell at the user.
+            var guiCfg = $scope.config.gui;
+            $scope.openNoAuth = guiCfg.address.substr(0, 4) != "127."
+                && guiCfg.address.substr(0, 6) != "[::1]:"
+                && (!guiCfg.user || !guiCfg.password)
+                && !guiCfg.insecureAdminAccess;
 
             if (!hasConfig) {
                 $scope.$emit('ConfigLoaded');
@@ -657,6 +667,69 @@ angular.module('syncthing.core')
             }
             var pct = 100 * $scope.scanProgress[folder].current / $scope.scanProgress[folder].total;
             return Math.floor(pct);
+        }
+
+        $scope.scanRate = function (folder) {
+            if (!$scope.scanProgress[folder]) {
+                return 0;
+            }
+            return $scope.scanProgress[folder].rate;
+        }
+
+        $scope.scanRemaining = function (folder) {
+            // Formats the remaining scan time as a string. Includes days and
+            // hours only when relevant, resulting in time stamps like:
+            // 00m 40s
+            // 32m 40s
+            // 2h 32m
+            // 4d 2h
+
+            var res = [];
+
+            if (!$scope.scanProgress[folder]) {
+                return "";
+            }
+
+            // Calculate remaining bytes and seconds based on our current
+            // rate.
+            var remainingBytes = $scope.scanProgress[folder].total - $scope.scanProgress[folder].current;
+            var seconds = remainingBytes / $scope.scanProgress[folder].rate;
+
+            // Round up to closest ten seconds to avoid flapping too much to
+            // and fro.
+            seconds = Math.ceil(seconds / 10) * 10;
+
+            // Separate out the number of days.
+            var days = 0;
+            if (seconds >= 86400) {
+                days = Math.floor(seconds / 86400);
+                res.push('' + days + 'd')
+                seconds = seconds % 86400;
+            }
+
+            // Separate out the number of hours.
+            var hours = 0;
+            if (seconds > 3600) {
+                hours = Math.floor(seconds / 3600);
+                res.push('' + hours + 'h')
+                seconds = seconds % 3600;
+            }
+
+            var d = new Date(1970, 0, 1).setSeconds(seconds);
+
+            if (days == 0) {
+                // Format minutes only if we're within a day of completion.
+                var f = $filter('date')(d, "m'm'");
+                res.push(f);
+            }
+
+            if (days == 0 && hours == 0) {
+                // Format seconds only when we're within an hour of completion.
+                var f = $filter('date')(d, "ss's'");
+                res.push(f);
+            }
+
+            return res.join(' ');
         }
 
         $scope.deviceStatus = function (deviceCfg) {
@@ -1341,10 +1414,13 @@ angular.module('syncthing.core')
         };
 
         $scope.showURPreview = function () {
-            $('#settings').modal('hide');
-            $('#urPreview').modal().on('hidden.bs.modal', function () {
-                $('#settings').modal();
-            });
+            $('#settings').modal('hide')
+                .one('hidden.bs.modal', function() {
+                    $('#urPreview').modal()
+                        .one('hidden.bs.modal', function () {
+                            $('#settings').modal();
+                        });
+                });
         };
 
         $scope.acceptUR = function () {
