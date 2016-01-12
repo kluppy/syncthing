@@ -36,29 +36,21 @@ var (
 	DefaultDiscoveryServersV4 = []string{
 		"https://discovery-v4-1.syncthing.net/?id=SR7AARM-TCBUZ5O-VFAXY4D-CECGSDE-3Q6IZ4G-XG7AH75-OBIXJQV-QJ6NLQA", // 194.126.249.5, Sweden
 		"https://discovery-v4-2.syncthing.net/?id=DVU36WY-H3LVZHW-E6LLFRE-YAFN5EL-HILWRYP-OC2M47J-Z4PE62Y-ADIBDQC", // 45.55.230.38, USA
-		"https://discovery-v4-3.syncthing.net/?id=7WT2BVR-FX62ZOW-TNVVW25-6AHFJGD-XEXQSBW-VO3MPL2-JBTLL4T-P4572Q4", // 128.199.95.124, Singapore
+		"https://discovery-v4-3.syncthing.net/?id=VK6HNJ3-VVMM66S-HRVWSCR-IXEHL2H-U4AQ4MW-UCPQBWX-J2L2UBK-NVZRDQZ", // 128.199.95.124, Singapore
 	}
 	// DefaultDiscoveryServersV6 should be substituted when the configuration
 	// contains <globalAnnounceServer>default-v6</globalAnnounceServer>.
 	DefaultDiscoveryServersV6 = []string{
 		"https://discovery-v6-1.syncthing.net/?id=SR7AARM-TCBUZ5O-VFAXY4D-CECGSDE-3Q6IZ4G-XG7AH75-OBIXJQV-QJ6NLQA", // 2001:470:28:4d6::5, Sweden
 		"https://discovery-v6-2.syncthing.net/?id=DVU36WY-H3LVZHW-E6LLFRE-YAFN5EL-HILWRYP-OC2M47J-Z4PE62Y-ADIBDQC", // 2604:a880:800:10::182:a001, USA
-		"https://discovery-v6-3.syncthing.net/?id=7WT2BVR-FX62ZOW-TNVVW25-6AHFJGD-XEXQSBW-VO3MPL2-JBTLL4T-P4572Q4", // 2400:6180:0:d0::d9:d001, Singapore
+		"https://discovery-v6-3.syncthing.net/?id=VK6HNJ3-VVMM66S-HRVWSCR-IXEHL2H-U4AQ4MW-UCPQBWX-J2L2UBK-NVZRDQZ", // 2400:6180:0:d0::d9:d001, Singapore
 	}
 	// DefaultDiscoveryServers should be substituted when the configuration
 	// contains <globalAnnounceServer>default</globalAnnounceServer>.
 	DefaultDiscoveryServers = append(DefaultDiscoveryServersV4, DefaultDiscoveryServersV6...)
 
-	// DefaultDiscoveryServersIP is used by the usage reporting.
-	// XXX: Detect Android, and use this is we still don't have working DNS?
-	DefaultDiscoveryServersIP = []string{
-		"https://194.126.249.5/?id=SR7AARM-TCBUZ5O-VFAXY4D-CECGSDE-3Q6IZ4G-XG7AH75-OBIXJQV-QJ6NLQA",
-		"https://45.55.230.38/?id=AQEHEO2-XOS7QRA-X2COH5K-PO6OPVA-EWOSEGO-KZFMD32-XJ4ZV46-CUUVKAS",
-		"https://128.199.95.124/?id=7WT2BVR-FX62ZOW-TNVVW25-6AHFJGD-XEXQSBW-VO3MPL2-JBTLL4T-P4572Q4",
-		"https://[2001:470:28:4d6::5]/?id=SR7AARM-TCBUZ5O-VFAXY4D-CECGSDE-3Q6IZ4G-XG7AH75-OBIXJQV-QJ6NLQA",
-		"https://[2604:a880:800:10::182:a001]/?id=AQEHEO2-XOS7QRA-X2COH5K-PO6OPVA-EWOSEGO-KZFMD32-XJ4ZV46-CUUVKAS",
-		"https://[2400:6180:0:d0::d9:d001]/?id=7WT2BVR-FX62ZOW-TNVVW25-6AHFJGD-XEXQSBW-VO3MPL2-JBTLL4T-P4572Q4",
-	}
+	// DefaultTheme is the default and fallback theme for the web UI.
+	DefaultTheme = "default"
 )
 
 func New(myID protocol.DeviceID) Configuration {
@@ -210,6 +202,9 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) {
 		existingDevices[myID] = true
 	}
 
+	// Ensure that the device list is free from duplicates
+	cfg.Devices = ensureNoDuplicateDevices(cfg.Devices)
+
 	sort.Sort(DeviceConfigurationList(cfg.Devices))
 	// Ensure that any loose devices are not present in the wrong places
 	// Ensure that there are no duplicate devices
@@ -217,7 +212,7 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) {
 	for i := range cfg.Folders {
 		cfg.Folders[i].Devices = ensureDevicePresent(cfg.Folders[i].Devices, myID)
 		cfg.Folders[i].Devices = ensureExistingDevices(cfg.Folders[i].Devices, existingDevices)
-		cfg.Folders[i].Devices = ensureNoDuplicates(cfg.Folders[i].Devices)
+		cfg.Folders[i].Devices = ensureNoDuplicateFolderDevices(cfg.Folders[i].Devices)
 		sort.Sort(FolderDeviceConfigurationList(cfg.Folders[i].Devices))
 	}
 
@@ -419,7 +414,25 @@ loop:
 	return devices[0:count]
 }
 
-func ensureNoDuplicates(devices []FolderDeviceConfiguration) []FolderDeviceConfiguration {
+func ensureNoDuplicateFolderDevices(devices []FolderDeviceConfiguration) []FolderDeviceConfiguration {
+	count := len(devices)
+	i := 0
+	seenDevices := make(map[protocol.DeviceID]bool)
+loop:
+	for i < count {
+		id := devices[i].DeviceID
+		if _, ok := seenDevices[id]; ok {
+			devices[i] = devices[count-1]
+			count--
+			continue loop
+		}
+		seenDevices[id] = true
+		i++
+	}
+	return devices[0:count]
+}
+
+func ensureNoDuplicateDevices(devices []DeviceConfiguration) []DeviceConfiguration {
 	count := len(devices)
 	i := 0
 	seenDevices := make(map[protocol.DeviceID]bool)

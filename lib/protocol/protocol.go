@@ -66,6 +66,13 @@ const (
 	FlagFolderReadOnly     uint32 = 1 << 0
 	FlagFolderIgnorePerms         = 1 << 1
 	FlagFolderIgnoreDelete        = 1 << 2
+
+	// The folder hash algorithm IDs, to be put in the flags field by shifting
+	// left FolderHashShiftBits. 1 through 15 currently reserved.
+
+	FolderHashSHA256    = 0
+	FolderHashMask      = 15
+	FolderHashShiftBits = 3
 )
 
 // ClusterConfigMessage.Folders.Devices flags
@@ -106,6 +113,7 @@ type Connection interface {
 	Request(folder string, name string, offset int64, size int, hash []byte, flags uint32, options []Option) ([]byte, error)
 	ClusterConfig(config ClusterConfigMessage)
 	Statistics() Statistics
+	Closed() bool
 }
 
 type rawConnection struct {
@@ -278,6 +286,15 @@ func (c *rawConnection) Request(folder string, name string, offset int64, size i
 // ClusterConfig send the cluster configuration message to the peer and returns any error
 func (c *rawConnection) ClusterConfig(config ClusterConfigMessage) {
 	c.send(-1, messageTypeClusterConfig, config, nil)
+}
+
+func (c *rawConnection) Closed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *rawConnection) ping() bool {

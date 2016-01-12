@@ -34,7 +34,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestHeaderFunctions(t *testing.T) {
-	t.Parallel()
 	f := func(ver, id, typ int) bool {
 		ver = int(uint(ver) % 16)
 		id = int(uint(id) % 4096)
@@ -49,7 +48,6 @@ func TestHeaderFunctions(t *testing.T) {
 }
 
 func TestHeaderLayout(t *testing.T) {
-	t.Parallel()
 	var e, a uint32
 
 	// Version are the first four bits
@@ -75,13 +73,12 @@ func TestHeaderLayout(t *testing.T) {
 }
 
 func TestPing(t *testing.T) {
-	t.Parallel()
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, newTestModel(), "name", CompressAlways).(wireFormatConnection).next.(*rawConnection)
+	c0 := NewConnection(c0ID, ar, bw, newTestModel(), "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c0.Start()
-	c1 := NewConnection(c1ID, br, aw, newTestModel(), "name", CompressAlways).(wireFormatConnection).next.(*rawConnection)
+	c1 := NewConnection(c1ID, br, aw, newTestModel(), "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c1.Start()
 	c0.ClusterConfig(ClusterConfigMessage{})
 	c1.ClusterConfig(ClusterConfigMessage{})
@@ -95,14 +92,13 @@ func TestPing(t *testing.T) {
 }
 
 func TestVersionErr(t *testing.T) {
-	t.Parallel()
 	m0 := newTestModel()
 	m1 := newTestModel()
 
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).next.(*rawConnection)
+	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c0.Start()
 	c1 := NewConnection(c1ID, br, aw, m1, "name", CompressAlways)
 	c1.Start()
@@ -123,14 +119,13 @@ func TestVersionErr(t *testing.T) {
 }
 
 func TestTypeErr(t *testing.T) {
-	t.Parallel()
 	m0 := newTestModel()
 	m1 := newTestModel()
 
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).next.(*rawConnection)
+	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c0.Start()
 	c1 := NewConnection(c1ID, br, aw, m1, "name", CompressAlways)
 	c1.Start()
@@ -151,14 +146,13 @@ func TestTypeErr(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	t.Parallel()
 	m0 := newTestModel()
 	m1 := newTestModel()
 
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).next.(*rawConnection)
+	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c0.Start()
 	c1 := NewConnection(c1ID, br, aw, m1, "name", CompressAlways)
 	c1.Start()
@@ -187,7 +181,6 @@ func TestClose(t *testing.T) {
 }
 
 func TestElementSizeExceededNested(t *testing.T) {
-	t.Parallel()
 	m := ClusterConfigMessage{
 		ClientName: "longstringlongstringlongstringinglongstringlongstringlonlongstringlongstringlon",
 	}
@@ -198,7 +191,6 @@ func TestElementSizeExceededNested(t *testing.T) {
 }
 
 func TestMarshalIndexMessage(t *testing.T) {
-	t.Parallel()
 	f := func(m1 IndexMessage) bool {
 		for i, f := range m1.Files {
 			m1.Files[i].CachedSize = 0
@@ -219,7 +211,6 @@ func TestMarshalIndexMessage(t *testing.T) {
 }
 
 func TestMarshalRequestMessage(t *testing.T) {
-	t.Parallel()
 	f := func(m1 RequestMessage) bool {
 		return testMarshal(t, "request", &m1, &RequestMessage{})
 	}
@@ -230,7 +221,6 @@ func TestMarshalRequestMessage(t *testing.T) {
 }
 
 func TestMarshalResponseMessage(t *testing.T) {
-	t.Parallel()
 	f := func(m1 ResponseMessage) bool {
 		if len(m1.Data) == 0 {
 			m1.Data = nil
@@ -244,7 +234,6 @@ func TestMarshalResponseMessage(t *testing.T) {
 }
 
 func TestMarshalClusterConfigMessage(t *testing.T) {
-	t.Parallel()
 	f := func(m1 ClusterConfigMessage) bool {
 		return testMarshal(t, "clusterconfig", &m1, &ClusterConfigMessage{})
 	}
@@ -255,7 +244,6 @@ func TestMarshalClusterConfigMessage(t *testing.T) {
 }
 
 func TestMarshalCloseMessage(t *testing.T) {
-	t.Parallel()
 	f := func(m1 CloseMessage) bool {
 		return testMarshal(t, "close", &m1, &CloseMessage{})
 	}

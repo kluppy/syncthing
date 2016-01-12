@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
@@ -79,19 +80,20 @@ type rwFolder struct {
 	progressEmitter  *ProgressEmitter
 	virtualMtimeRepo *db.VirtualMtimeRepo
 
-	folder       string
-	dir          string
-	scanIntv     time.Duration
-	versioner    versioner.Versioner
-	ignorePerms  bool
-	copiers      int
-	pullers      int
-	shortID      uint64
-	order        config.PullOrder
-	maxConflicts int
-	sleep        time.Duration
-	pause        time.Duration
-	allowSparse  bool
+	folder         string
+	dir            string
+	scanIntv       time.Duration
+	versioner      versioner.Versioner
+	ignorePerms    bool
+	copiers        int
+	pullers        int
+	shortID        uint64
+	order          config.PullOrder
+	maxConflicts   int
+	sleep          time.Duration
+	pause          time.Duration
+	allowSparse    bool
+	checkFreeSpace bool
 
 	stop        chan struct{}
 	queue       *jobQueue
@@ -117,16 +119,17 @@ func newRWFolder(m *Model, shortID uint64, cfg config.FolderConfiguration) *rwFo
 		progressEmitter:  m.progressEmitter,
 		virtualMtimeRepo: db.NewVirtualMtimeRepo(m.db, cfg.ID),
 
-		folder:       cfg.ID,
-		dir:          cfg.Path(),
-		scanIntv:     time.Duration(cfg.RescanIntervalS) * time.Second,
-		ignorePerms:  cfg.IgnorePerms,
-		copiers:      cfg.Copiers,
-		pullers:      cfg.Pullers,
-		shortID:      shortID,
-		order:        cfg.Order,
-		maxConflicts: cfg.MaxConflicts,
-		allowSparse:  !cfg.DisableSparseFiles,
+		folder:         cfg.ID,
+		dir:            cfg.Path(),
+		scanIntv:       time.Duration(cfg.RescanIntervalS) * time.Second,
+		ignorePerms:    cfg.IgnorePerms,
+		copiers:        cfg.Copiers,
+		pullers:        cfg.Pullers,
+		shortID:        shortID,
+		order:          cfg.Order,
+		maxConflicts:   cfg.MaxConflicts,
+		allowSparse:    !cfg.DisableSparseFiles,
+		checkFreeSpace: cfg.MinDiskFreePct != 0,
 
 		stop:        make(chan struct{}),
 		queue:       newJobQueue(),
@@ -716,6 +719,7 @@ func (p *rwFolder) deleteDir(file protocol.FileInfo) {
 				osutil.InWritableDir(osutil.Remove, filepath.Join(realName, file))
 			}
 		}
+		dir.Close()
 	}
 
 	err = osutil.InWritableDir(osutil.Remove, realName)
@@ -966,23 +970,11 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 		}
 	}
 
-	if free, err := osutil.DiskFreeBytes(p.dir); err == nil && free < file.Size() {
-		l.Warnf(`Folder "%s": insufficient disk space in %s for %s: have %.2f MiB, need %.2f MiB`, p.folder, p.dir, file.Name, float64(free)/1024/1024, float64(file.Size())/1024/1024)
-		p.newError(file.Name, errors.New("insufficient space"))
-		return
-	}
-
-	events.Default.Log(events.ItemStarted, map[string]string{
-		"folder": p.folder,
-		"item":   file.Name,
-		"type":   "file",
-		"action": "update",
-	})
-
 	scanner.PopulateOffsets(file.Blocks)
 
 	reused := 0
 	var blocks []protocol.BlockInfo
+	var blocksSize int64
 
 	// Check for an old temporary file which might have some blocks we could
 	// reuse.
@@ -1002,6 +994,7 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 			_, ok := existingBlocks[block.String()]
 			if !ok {
 				blocks = append(blocks, block)
+				blocksSize += int64(block.Size)
 			}
 		}
 
@@ -1016,7 +1009,23 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 		}
 	} else {
 		blocks = file.Blocks
+		blocksSize = file.Size()
 	}
+
+	if p.checkFreeSpace {
+		if free, err := osutil.DiskFreeBytes(p.dir); err == nil && free < blocksSize {
+			l.Warnf(`Folder "%s": insufficient disk space in %s for %s: have %.2f MiB, need %.2f MiB`, p.folder, p.dir, file.Name, float64(free)/1024/1024, float64(blocksSize)/1024/1024)
+			p.newError(file.Name, errors.New("insufficient space"))
+			return
+		}
+	}
+
+	events.Default.Log(events.ItemStarted, map[string]string{
+		"folder": p.folder,
+		"item":   file.Name,
+		"type":   "file",
+		"action": "update",
+	})
 
 	s := sharedPullerState{
 		file:        file,
@@ -1485,6 +1494,14 @@ func removeDevice(devices []protocol.DeviceID, device protocol.DeviceID) []proto
 }
 
 func (p *rwFolder) moveForConflict(name string) error {
+	if strings.Contains(filepath.Base(name), ".sync-conflict-") {
+		l.Infoln("Conflict for", name, "which is already a conflict copy; not copying again.")
+		if err := osutil.Remove(name); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+
 	if p.maxConflicts == 0 {
 		if err := osutil.Remove(name); err != nil && !os.IsNotExist(err) {
 			return err

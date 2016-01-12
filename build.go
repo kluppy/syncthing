@@ -64,7 +64,7 @@ func main() {
 	flag.Parse()
 
 	switch goarch {
-	case "386", "amd64", "arm":
+	case "386", "amd64", "arm", "arm64", "ppc64", "ppc64le":
 		break
 	default:
 		log.Printf("Unknown goarch %q; proceed with caution!", goarch)
@@ -182,6 +182,7 @@ func setup() {
 	runPrint("go", "get", "-v", "github.com/tools/godep")
 	runPrint("go", "get", "-v", "github.com/axw/gocov/gocov")
 	runPrint("go", "get", "-v", "github.com/AlekSi/gocov-xml")
+	runPrint("go", "get", "-v", "bitbucket.org/tebeka/go2xunit")
 }
 
 func test(pkg string) {
@@ -219,7 +220,7 @@ func build(pkg string, tags []string) {
 	}
 
 	rmr(binary)
-	args := []string{"build", "-ldflags", ldflags()}
+	args := []string{"build", "-i", "-v", "-ldflags", ldflags()}
 	if len(tags) > 0 {
 		args = append(args, "-tags", strings.Join(tags, ","))
 	}
@@ -409,7 +410,7 @@ func xdr() {
 }
 
 func translate() {
-	os.Chdir("gui/assets/lang")
+	os.Chdir("gui/default/assets/lang")
 	runPipe("lang-en-new.json", "go", "run", "../../../script/translate.go", "lang-en.json", "../../")
 	os.Remove("lang-en.json")
 	err := os.Rename("lang-en-new.json", "lang-en.json")
@@ -420,7 +421,7 @@ func translate() {
 }
 
 func transifex() {
-	os.Chdir("gui/assets/lang")
+	os.Chdir("gui/default/assets/lang")
 	runPrint("go", "run", "../../../script/transifexdl.go")
 	os.Chdir("../../..")
 	assets()
@@ -448,7 +449,6 @@ func ldflags() string {
 	fmt.Fprintf(b, " -X main.BuildStamp%c%d", sep, buildStamp())
 	fmt.Fprintf(b, " -X main.BuildUser%c%s", sep, buildUser())
 	fmt.Fprintf(b, " -X main.BuildHost%c%s", sep, buildHost())
-	fmt.Fprintf(b, " -X main.BuildEnv%c%s", sep, buildEnvironment())
 	return b.String()
 }
 

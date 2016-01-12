@@ -520,11 +520,7 @@ func (m *Model) Index(deviceID protocol.DeviceID, folder string, fs []protocol.F
 	l.Debugf("IDX(in): %s %q: %d files", deviceID, folder, len(fs))
 
 	if !m.folderSharedWith(folder, deviceID) {
-		events.Default.Log(events.FolderRejected, map[string]string{
-			"folder": folder,
-			"device": deviceID.String(),
-		})
-		l.Infof("Unexpected folder ID %q sent from device %q; ensure that the folder exists and that this device is selected under \"Share With\" in the folder configuration.", folder, deviceID)
+		l.Debugf("Unexpected folder ID %q sent from device %q; ensure that the folder exists and that this device is selected under \"Share With\" in the folder configuration.", folder, deviceID)
 		return
 	}
 
@@ -566,7 +562,7 @@ func (m *Model) IndexUpdate(deviceID protocol.DeviceID, folder string, fs []prot
 	l.Debugf("%v IDXUP(in): %s / %q: %d files", m, deviceID, folder, len(fs))
 
 	if !m.folderSharedWith(folder, deviceID) {
-		l.Infof("Update for unexpected folder ID %q sent from device %q; ensure that the folder exists and that this device is selected under \"Share With\" in the folder configuration.", folder, deviceID)
+		l.Debugf("Update for unexpected folder ID %q sent from device %q; ensure that the folder exists and that this device is selected under \"Share With\" in the folder configuration.", folder, deviceID)
 		return
 	}
 
@@ -596,6 +592,10 @@ func (m *Model) IndexUpdate(deviceID protocol.DeviceID, folder string, fs []prot
 func (m *Model) folderSharedWith(folder string, deviceID protocol.DeviceID) bool {
 	m.fmut.RLock()
 	defer m.fmut.RUnlock()
+	return m.folderSharedWithUnlocked(folder, deviceID)
+}
+
+func (m *Model) folderSharedWithUnlocked(folder string, deviceID protocol.DeviceID) bool {
 	for _, nfolder := range m.deviceFolders[deviceID] {
 		if nfolder == folder {
 			return true
@@ -628,6 +628,37 @@ func (m *Model) ClusterConfig(deviceID protocol.DeviceID, cm protocol.ClusterCon
 	}
 
 	m.pmut.Unlock()
+
+	// Check the peer device's announced folders against our own. Emits events
+	// for folders that we don't expect (unknown or not shared).
+
+	m.fmut.Lock()
+nextFolder:
+	for _, folder := range cm.Folders {
+		cfg := m.folderCfgs[folder.ID]
+
+		if _, err := protocol.HashAlgorithmFromFlagBits(folder.Flags); err != nil {
+			// The hash algorithm failed to deserialize, so it's not SHA256
+			// (the only acceptable algorithm).
+			l.Warnf("Device %v: %v", deviceID, err)
+			cfg.Invalid = err.Error() + " from " + deviceID.String()
+			m.cfg.SetFolder(cfg)
+			if srv := m.folderRunners[folder.ID]; srv != nil {
+				srv.setError(fmt.Errorf(cfg.Invalid))
+			}
+			continue nextFolder
+		}
+
+		if !m.folderSharedWithUnlocked(folder.ID, deviceID) {
+			events.Default.Log(events.FolderRejected, map[string]string{
+				"folder": folder.ID,
+				"device": deviceID.String(),
+			})
+			l.Infof("Unexpected folder ID %q sent from device %q; ensure that the folder exists and that this device is selected under \"Share With\" in the folder configuration.", folder.ID, deviceID)
+			continue
+		}
+	}
+	m.fmut.Unlock()
 
 	events.Default.Log(events.DeviceConnected, event)
 
@@ -893,6 +924,10 @@ func (m *Model) GetIgnores(folder string) ([]string, []string, error) {
 		return lines, nil, fmt.Errorf("Folder %s does not exist", folder)
 	}
 
+	if !cfg.HasMarker() {
+		return lines, nil, fmt.Errorf("Folder %s stopped", folder)
+	}
+
 	fd, err := os.Open(filepath.Join(cfg.Path(), ".stignore"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1038,10 +1073,18 @@ func sendIndexes(conn protocol.Connection, folder string, fs *db.FileSet, ignore
 
 	minLocalVer, err := sendIndexTo(true, 0, conn, folder, fs, ignores)
 
-	sub := events.Default.Subscribe(events.LocalIndexUpdated)
+	// Subscribe to LocalIndexUpdated (we have new information to send) and
+	// DeviceDisconnected (it might be us who disconnected, so we should
+	// exit).
+	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.DeviceDisconnected)
 	defer events.Default.Unsubscribe(sub)
 
 	for err == nil {
+		if conn.Closed() {
+			// Our work is done.
+			return
+		}
+
 		// While we have sent a localVersion at least equal to the one
 		// currently in the database, wait for the local index to update. The
 		// local index may update for other folders than the one we are
@@ -1128,10 +1171,16 @@ func (m *Model) updateLocals(folder string, fs []protocol.FileInfo) {
 	m.fmut.RUnlock()
 	files.Update(protocol.LocalDeviceID, fs)
 
+	filenames := make([]string, len(fs))
+	for i, file := range fs {
+		filenames[i] = file.Name
+	}
+
 	events.Default.Log(events.LocalIndexUpdated, map[string]interface{}{
-		"folder":  folder,
-		"items":   len(fs),
-		"version": files.LocalVersion(protocol.LocalDeviceID),
+		"folder":    folder,
+		"items":     len(fs),
+		"filenames": filenames,
+		"version":   files.LocalVersion(protocol.LocalDeviceID),
 	})
 }
 
@@ -1753,8 +1802,11 @@ func (m *Model) CheckFolderHealth(id string) error {
 			// Check for free space, if it isn't a master folder. We aren't
 			// going to change the contents of master folders, so we don't
 			// care about the amount of free space there.
-			if free, errDfp := osutil.DiskFreePercentage(folder.Path()); errDfp == nil && free < folder.MinDiskFreePct {
-				err = errors.New("insufficient free space")
+			diskFreeP, errDfp := osutil.DiskFreePercentage(folder.Path())
+			if errDfp == nil && diskFreeP < folder.MinDiskFreePct {
+				diskFreeBytes, _ := osutil.DiskFreeBytes(folder.Path())
+				str := fmt.Sprintf("insufficient free space (%d MiB, %.2f%%)", diskFreeBytes/1024/1024, diskFreeP)
+				err = errors.New(str)
 			}
 		}
 	} else {

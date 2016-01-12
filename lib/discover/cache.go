@@ -26,7 +26,7 @@ type CachingMux struct {
 	*suture.Supervisor
 	finders []cachedFinder
 	caches  []*cache
-	mut     sync.Mutex
+	mut     sync.RWMutex
 }
 
 // A cachedFinder is a Finder with associated cache timeouts.
@@ -44,10 +44,17 @@ type prioritizedAddress struct {
 	addr     string
 }
 
+// An error may implement cachedError, in which case it will be interrogated
+// to see how long we should cache the error. This overrides the default
+// negative cache time.
+type cachedError interface {
+	CacheFor() time.Duration
+}
+
 func NewCachingMux() *CachingMux {
 	return &CachingMux{
 		Supervisor: suture.NewSimple("discover.cachingMux"),
-		mut:        sync.NewMutex(),
+		mut:        sync.NewRWMutex(),
 	}
 }
 
@@ -58,8 +65,8 @@ func (m *CachingMux) Add(finder Finder, cacheTime, negCacheTime time.Duration, p
 	m.caches = append(m.caches, newCache())
 	m.mut.Unlock()
 
-	if svc, ok := finder.(suture.Service); ok {
-		m.Supervisor.Add(svc)
+	if service, ok := finder.(suture.Service); ok {
+		m.Supervisor.Add(service)
 	}
 }
 
@@ -68,7 +75,7 @@ func (m *CachingMux) Add(finder Finder, cacheTime, negCacheTime time.Duration, p
 func (m *CachingMux) Lookup(deviceID protocol.DeviceID) (direct []string, relays []Relay, err error) {
 	var pdirect []prioritizedAddress
 
-	m.mut.Lock()
+	m.mut.RLock()
 	for i, finder := range m.finders {
 		if cacheEntry, ok := m.caches[i].Get(deviceID); ok {
 			// We have a cache entry. Lets see what it says.
@@ -84,10 +91,11 @@ func (m *CachingMux) Lookup(deviceID protocol.DeviceID) (direct []string, relays
 				continue
 			}
 
-			if !cacheEntry.found && time.Since(cacheEntry.when) < finder.negCacheTime {
+			valid := time.Now().Before(cacheEntry.validUntil) || time.Since(cacheEntry.when) < finder.negCacheTime
+			if !cacheEntry.found && valid {
 				// It's a negative, valid entry. We should not make another
 				// attempt right now.
-				l.Debugln("negative cache entry for", deviceID, "at", finder)
+				l.Debugln("negative cache entry for", deviceID, "at", finder, "valid until", cacheEntry.when.Add(finder.negCacheTime), "or", cacheEntry.validUntil)
 				continue
 			}
 
@@ -111,13 +119,17 @@ func (m *CachingMux) Lookup(deviceID protocol.DeviceID) (direct []string, relays
 			})
 		} else {
 			// Lookup returned error, add a negative cache entry.
-			m.caches[i].Set(deviceID, CacheEntry{
+			entry := CacheEntry{
 				when:  time.Now(),
 				found: false,
-			})
+			}
+			if err, ok := err.(cachedError); ok {
+				entry.validUntil = time.Now().Add(err.CacheFor())
+			}
+			m.caches[i].Set(deviceID, entry)
 		}
 	}
-	m.mut.Unlock()
+	m.mut.RUnlock()
 
 	direct = uniqueSortedAddrs(pdirect)
 	relays = uniqueSortedRelays(relays)
@@ -137,12 +149,12 @@ func (m *CachingMux) Error() error {
 }
 
 func (m *CachingMux) ChildErrors() map[string]error {
-	m.mut.Lock()
 	children := make(map[string]error, len(m.finders))
+	m.mut.RLock()
 	for _, f := range m.finders {
 		children[f.String()] = f.Error()
 	}
-	m.mut.Unlock()
+	m.mut.RUnlock()
 	return children
 }
 
@@ -151,7 +163,7 @@ func (m *CachingMux) Cache() map[protocol.DeviceID]CacheEntry {
 	// children's caches.
 	res := make(map[protocol.DeviceID]CacheEntry)
 
-	m.mut.Lock()
+	m.mut.RLock()
 	for i := range m.finders {
 		// Each finder[i] has a corresponding cache at cache[i]. Go through it
 		// and populate the total, if it's newer than what's already in there.
@@ -171,7 +183,7 @@ func (m *CachingMux) Cache() map[protocol.DeviceID]CacheEntry {
 			}
 		}
 	}
-	m.mut.Unlock()
+	m.mut.RUnlock()
 
 	return res
 }

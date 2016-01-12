@@ -20,6 +20,7 @@ type GUIConfiguration struct {
 	RawUseTLS           bool   `xml:"tls,attr" json:"useTLS"`
 	RawAPIKey           string `xml:"apikey,omitempty" json:"apiKey"`
 	InsecureAdminAccess bool   `xml:"insecureAdminAccess,omitempty" json:"insecureAdminAccess"`
+	Theme               string `xml:"theme" json:"theme" default:"default"`
 }
 
 func (c GUIConfiguration) Address() string {
@@ -44,7 +45,7 @@ func (c GUIConfiguration) Address() string {
 }
 
 func (c GUIConfiguration) UseTLS() bool {
-	if override := os.Getenv("STGUIADDRESS"); override != "" {
+	if override := os.Getenv("STGUIADDRESS"); override != "" && strings.HasPrefix(override, "http") {
 		return strings.HasPrefix(override, "https:")
 	}
 	return c.RawUseTLS

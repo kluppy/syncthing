@@ -48,16 +48,17 @@ var (
 	startTime    = time.Now()
 )
 
-type apiSvc struct {
+type apiService struct {
 	id              protocol.DeviceID
 	cfg             *config.Wrapper
 	assetDir        string
+	themes          []string
 	model           *model.Model
 	eventSub        *events.BufferedSubscription
 	discoverer      *discover.CachingMux
-	relaySvc        *relay.Svc
+	relayService    *relay.Service
 	listener        net.Listener
-	fss             *folderSummarySvc
+	fss             *folderSummaryService
 	stop            chan struct{}
 	systemConfigMut sync.Mutex
 
@@ -65,26 +66,35 @@ type apiSvc struct {
 	systemLog *logger.Recorder
 }
 
-func newAPISvc(id protocol.DeviceID, cfg *config.Wrapper, assetDir string, m *model.Model, eventSub *events.BufferedSubscription, discoverer *discover.CachingMux, relaySvc *relay.Svc, errors, systemLog *logger.Recorder) (*apiSvc, error) {
-	svc := &apiSvc{
+func newAPIService(id protocol.DeviceID, cfg *config.Wrapper, assetDir string, m *model.Model, eventSub *events.BufferedSubscription, discoverer *discover.CachingMux, relayService *relay.Service, errors, systemLog *logger.Recorder) (*apiService, error) {
+	service := &apiService{
 		id:              id,
 		cfg:             cfg,
 		assetDir:        assetDir,
 		model:           m,
 		eventSub:        eventSub,
 		discoverer:      discoverer,
-		relaySvc:        relaySvc,
+		relayService:    relayService,
 		systemConfigMut: sync.NewMutex(),
 		guiErrors:       errors,
 		systemLog:       systemLog,
 	}
 
+	seen := make(map[string]struct{})
+	for file := range auto.Assets() {
+		theme := strings.Split(file, "/")[0]
+		if _, ok := seen[theme]; !ok {
+			seen[theme] = struct{}{}
+			service.themes = append(service.themes, theme)
+		}
+	}
+
 	var err error
-	svc.listener, err = svc.getListener(cfg.GUI())
-	return svc, err
+	service.listener, err = service.getListener(cfg.GUI())
+	return service, err
 }
 
-func (s *apiSvc) getListener(guiCfg config.GUIConfiguration) (net.Listener, error) {
+func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, error) {
 	cert, err := tls.LoadX509KeyPair(locations[locHTTPSCertFile], locations[locHTTPSKeyFile])
 	if err != nil {
 		l.Infoln("Loading HTTPS certificate:", err)
@@ -130,7 +140,12 @@ func (s *apiSvc) getListener(guiCfg config.GUIConfiguration) (net.Listener, erro
 	return listener, nil
 }
 
-func (s *apiSvc) Serve() {
+func sendJSON(w http.ResponseWriter, jsonObject interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(jsonObject)
+}
+
+func (s *apiService) Serve() {
 	s.stop = make(chan struct{})
 
 	// The GET handlers
@@ -193,10 +208,16 @@ func (s *apiSvc) Serve() {
 	mux.HandleFunc("/qr/", s.getQR)
 
 	// Serve compiled in assets unless an asset directory was set (for development)
-	mux.Handle("/", embeddedStatic{
-		assetDir: s.assetDir,
-		assets:   auto.Assets(),
-	})
+	assets := &embeddedStatic{
+		theme:        s.cfg.GUI().Theme,
+		lastModified: time.Now(),
+		mut:          sync.NewRWMutex(),
+		assetDir:     s.assetDir,
+		assets:       auto.Assets(),
+	}
+	mux.Handle("/", assets)
+
+	s.cfg.Subscribe(assets)
 
 	guiCfg := s.cfg.GUI()
 
@@ -224,7 +245,7 @@ func (s *apiSvc) Serve() {
 		ReadTimeout: 10 * time.Second,
 	}
 
-	s.fss = newFolderSummarySvc(s.cfg, s.model)
+	s.fss = newFolderSummaryService(s.cfg, s.model)
 	defer s.fss.Stop()
 	s.fss.ServeBackground()
 
@@ -242,20 +263,20 @@ func (s *apiSvc) Serve() {
 	}
 }
 
-func (s *apiSvc) Stop() {
+func (s *apiService) Stop() {
 	close(s.stop)
 	s.listener.Close()
 }
 
-func (s *apiSvc) String() string {
-	return fmt.Sprintf("apiSvc@%p", s)
+func (s *apiService) String() string {
+	return fmt.Sprintf("apiService@%p", s)
 }
 
-func (s *apiSvc) VerifyConfiguration(from, to config.Configuration) error {
+func (s *apiService) VerifyConfiguration(from, to config.Configuration) error {
 	return nil
 }
 
-func (s *apiSvc) CommitConfiguration(from, to config.Configuration) bool {
+func (s *apiService) CommitConfiguration(from, to config.Configuration) bool {
 	if to.GUI == from.GUI {
 		return true
 	}
@@ -317,7 +338,7 @@ func debugMiddleware(h http.Handler) http.Handler {
 					written = rf.Int()
 				}
 			}
-			l.Debugf("http: %s %q: status %d, %d bytes in %.02f ms", r.Method, r.URL.String(), status, written, ms)
+			httpl.Debugf("http: %s %q: status %d, %d bytes in %.02f ms", r.Method, r.URL.String(), status, written, ms)
 		}
 	})
 }
@@ -365,16 +386,12 @@ func withDetailsMiddleware(id protocol.DeviceID, h http.Handler) http.Handler {
 	})
 }
 
-func (s *apiSvc) restPing(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]string{
-		"ping": "pong",
-	})
+func (s *apiService) restPing(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, map[string]string{"ping": "pong"})
 }
 
-func (s *apiSvc) getSystemVersion(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]string{
+func (s *apiService) getSystemVersion(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, map[string]string{
 		"version":     Version,
 		"codename":    Codename,
 		"longVersion": LongVersion,
@@ -383,29 +400,28 @@ func (s *apiSvc) getSystemVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *apiSvc) getSystemDebug(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+func (s *apiService) getSystemDebug(w http.ResponseWriter, r *http.Request) {
 	names := l.Facilities()
 	enabled := l.FacilityDebugging()
 	sort.Strings(enabled)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	sendJSON(w, map[string]interface{}{
 		"facilities": names,
 		"enabled":    enabled,
 	})
 }
 
-func (s *apiSvc) postSystemDebug(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemDebug(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	q := r.URL.Query()
 	for _, f := range strings.Split(q.Get("enable"), ",") {
-		if f == "" {
+		if f == "" || l.ShouldDebug(f) {
 			continue
 		}
 		l.SetDebug(f, true)
 		l.Infof("Enabled debug data for %q", f)
 	}
 	for _, f := range strings.Split(q.Get("disable"), ",") {
-		if f == "" {
+		if f == "" || !l.ShouldDebug(f) {
 			continue
 		}
 		l.SetDebug(f, false)
@@ -413,7 +429,7 @@ func (s *apiSvc) postSystemDebug(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *apiSvc) getDBBrowse(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDBBrowse(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
 	prefix := qs.Get("prefix")
@@ -424,14 +440,10 @@ func (s *apiSvc) getDBBrowse(w http.ResponseWriter, r *http.Request) {
 		levels = -1
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-
-	tree := s.model.GlobalDirectoryTree(folder, prefix, levels, dirsonly)
-
-	json.NewEncoder(w).Encode(tree)
+	sendJSON(w, s.model.GlobalDirectoryTree(folder, prefix, levels, dirsonly))
 }
 
-func (s *apiSvc) getDBCompletion(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDBCompletion(w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	var folder = qs.Get("folder")
 	var deviceStr = qs.Get("device")
@@ -442,20 +454,15 @@ func (s *apiSvc) getDBCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := map[string]float64{
+	sendJSON(w, map[string]float64{
 		"completion": s.model.Completion(device, folder),
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+	})
 }
 
-func (s *apiSvc) getDBStatus(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDBStatus(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
-	res := folderSummary(s.cfg, s.model, folder)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+	sendJSON(w, folderSummary(s.cfg, s.model, folder))
 }
 
 func folderSummary(cfg *config.Wrapper, m *model.Model, folder string) map[string]interface{} {
@@ -497,13 +504,13 @@ func folderSummary(cfg *config.Wrapper, m *model.Model, folder string) map[strin
 	return res
 }
 
-func (s *apiSvc) postDBOverride(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postDBOverride(w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	var folder = qs.Get("folder")
 	go s.model.Override(folder)
 }
 
-func (s *apiSvc) getDBNeed(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDBNeed(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 
 	folder := qs.Get("folder")
@@ -520,38 +527,29 @@ func (s *apiSvc) getDBNeed(w http.ResponseWriter, r *http.Request) {
 	progress, queued, rest, total := s.model.NeedFolderFiles(folder, page, perpage)
 
 	// Convert the struct to a more loose structure, and inject the size.
-	output := map[string]interface{}{
+	sendJSON(w, map[string]interface{}{
 		"progress": s.toNeedSlice(progress),
 		"queued":   s.toNeedSlice(queued),
 		"rest":     s.toNeedSlice(rest),
 		"total":    total,
 		"page":     page,
 		"perpage":  perpage,
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(output)
+	})
 }
 
-func (s *apiSvc) getSystemConnections(w http.ResponseWriter, r *http.Request) {
-	var res = s.model.ConnectionStats()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+func (s *apiService) getSystemConnections(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, s.model.ConnectionStats())
 }
 
-func (s *apiSvc) getDeviceStats(w http.ResponseWriter, r *http.Request) {
-	var res = s.model.DeviceStatistics()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+func (s *apiService) getDeviceStats(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, s.model.DeviceStatistics())
 }
 
-func (s *apiSvc) getFolderStats(w http.ResponseWriter, r *http.Request) {
-	var res = s.model.FolderStatistics()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+func (s *apiService) getFolderStats(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, s.model.FolderStatistics())
 }
 
-func (s *apiSvc) getDBFile(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDBFile(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
 	file := qs.Get("file")
@@ -559,26 +557,25 @@ func (s *apiSvc) getDBFile(w http.ResponseWriter, r *http.Request) {
 	lf, _ := s.model.CurrentFolderFile(folder, file)
 
 	av := s.model.Availability(folder, file)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	sendJSON(w, map[string]interface{}{
 		"global":       jsonFileInfo(gf),
 		"local":        jsonFileInfo(lf),
 		"availability": av,
 	})
 }
 
-func (s *apiSvc) getSystemConfig(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(s.cfg.Raw())
+func (s *apiService) getSystemConfig(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, s.cfg.Raw())
 }
 
-func (s *apiSvc) postSystemConfig(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	s.systemConfigMut.Lock()
 	defer s.systemConfigMut.Unlock()
 
 	to, err := config.ReadJSON(r.Body, myID)
 	if err != nil {
 		l.Warnln("decoding posted config:", err)
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -587,7 +584,7 @@ func (s *apiSvc) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 			hash, err := bcrypt.GenerateFromPassword([]byte(to.GUI.Password), 0)
 			if err != nil {
 				l.Warnln("bcrypting password:", err)
-				http.Error(w, err.Error(), 500)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
@@ -614,17 +611,16 @@ func (s *apiSvc) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Save()
 }
 
-func (s *apiSvc) getSystemConfigInsync(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]bool{"configInSync": configInSync})
+func (s *apiService) getSystemConfigInsync(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, map[string]bool{"configInSync": configInSync})
 }
 
-func (s *apiSvc) postSystemRestart(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemRestart(w http.ResponseWriter, r *http.Request) {
 	s.flushResponse(`{"ok": "restarting"}`, w)
 	go restart()
 }
 
-func (s *apiSvc) postSystemReset(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemReset(w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	folder := qs.Get("folder")
 
@@ -650,12 +646,12 @@ func (s *apiSvc) postSystemReset(w http.ResponseWriter, r *http.Request) {
 	go restart()
 }
 
-func (s *apiSvc) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
 	s.flushResponse(`{"ok": "shutting down"}`, w)
 	go shutdown()
 }
 
-func (s *apiSvc) flushResponse(resp string, w http.ResponseWriter) {
+func (s *apiService) flushResponse(resp string, w http.ResponseWriter) {
 	w.Write([]byte(resp + "\n"))
 	f := w.(http.Flusher)
 	f.Flush()
@@ -664,7 +660,7 @@ func (s *apiSvc) flushResponse(resp string, w http.ResponseWriter) {
 var cpuUsagePercent [10]float64 // The last ten seconds
 var cpuUsageLock = sync.NewRWMutex()
 
-func (s *apiSvc) getSystemStatus(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
@@ -688,12 +684,12 @@ func (s *apiSvc) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 		res["discoveryMethods"] = discoMethods
 		res["discoveryErrors"] = discoErrors
 	}
-	if s.relaySvc != nil {
+	if s.relayService != nil {
 		res["relaysEnabled"] = true
 		relayClientStatus := make(map[string]bool)
 		relayClientLatency := make(map[string]int)
-		for _, relay := range s.relaySvc.Relays() {
-			latency, ok := s.relaySvc.RelayStatus(relay)
+		for _, relay := range s.relayService.Relays() {
+			latency, ok := s.relayService.RelayStatus(relay)
 			relayClientStatus[relay] = ok
 			relayClientLatency[relay] = int(latency / time.Millisecond)
 		}
@@ -710,40 +706,37 @@ func (s *apiSvc) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 	res["pathSeparator"] = string(filepath.Separator)
 	res["uptime"] = int(time.Since(startTime).Seconds())
 	res["startTime"] = startTime
+	res["themes"] = s.themes
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+	sendJSON(w, res)
 }
 
-func (s *apiSvc) getSystemError(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string][]logger.Line{
+func (s *apiService) getSystemError(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, map[string][]logger.Line{
 		"errors": s.guiErrors.Since(time.Time{}),
 	})
 }
 
-func (s *apiSvc) postSystemError(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemError(w http.ResponseWriter, r *http.Request) {
 	bs, _ := ioutil.ReadAll(r.Body)
 	r.Body.Close()
 	l.Warnln(string(bs))
 }
 
-func (s *apiSvc) postSystemErrorClear(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemErrorClear(w http.ResponseWriter, r *http.Request) {
 	s.guiErrors.Clear()
 }
 
-func (s *apiSvc) getSystemLog(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getSystemLog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := time.Parse(time.RFC3339, q.Get("since"))
 	l.Debugln(err)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-
-	json.NewEncoder(w).Encode(map[string][]logger.Line{
+	sendJSON(w, map[string][]logger.Line{
 		"messages": s.systemLog.Since(since),
 	})
 }
 
-func (s *apiSvc) getSystemLogTxt(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getSystemLogTxt(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := time.Parse(time.RFC3339, q.Get("since"))
 	l.Debugln(err)
@@ -754,7 +747,7 @@ func (s *apiSvc) getSystemLogTxt(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *apiSvc) getSystemHTTPMetrics(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getSystemHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	stats := make(map[string]interface{})
 	metrics.Each(func(name string, intf interface{}) {
 		if m, ok := intf.(*metrics.StandardTimer); ok {
@@ -774,8 +767,7 @@ func (s *apiSvc) getSystemHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Write(bs)
 }
 
-func (s *apiSvc) getSystemDiscovery(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+func (s *apiService) getSystemDiscovery(w http.ResponseWriter, r *http.Request) {
 	devices := make(map[string]discover.CacheEntry)
 
 	if s.discoverer != nil {
@@ -787,17 +779,15 @@ func (s *apiSvc) getSystemDiscovery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	json.NewEncoder(w).Encode(devices)
+	sendJSON(w, devices)
 }
 
-func (s *apiSvc) getReport(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(reportData(s.cfg, s.model))
+func (s *apiService) getReport(w http.ResponseWriter, r *http.Request) {
+	sendJSON(w, reportData(s.cfg, s.model))
 }
 
-func (s *apiSvc) getDBIgnores(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDBIgnores(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	ignores, patterns, err := s.model.GetIgnores(qs.Get("folder"))
 	if err != nil {
@@ -805,13 +795,13 @@ func (s *apiSvc) getDBIgnores(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string][]string{
+	sendJSON(w, map[string][]string{
 		"ignore":   ignores,
 		"patterns": patterns,
 	})
 }
 
-func (s *apiSvc) postDBIgnores(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postDBIgnores(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 
 	var data map[string][]string
@@ -832,7 +822,7 @@ func (s *apiSvc) postDBIgnores(w http.ResponseWriter, r *http.Request) {
 	s.getDBIgnores(w, r)
 }
 
-func (s *apiSvc) getEvents(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getEvents(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	sinceStr := qs.Get("since")
 	limitStr := qs.Get("limit")
@@ -840,8 +830,6 @@ func (s *apiSvc) getEvents(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(limitStr)
 
 	s.fss.gotEventRequest()
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	// Flush before blocking, to indicate that we've received the request
 	// and that it should not be retried.
@@ -853,10 +841,10 @@ func (s *apiSvc) getEvents(w http.ResponseWriter, r *http.Request) {
 		evs = evs[len(evs)-limit:]
 	}
 
-	json.NewEncoder(w).Encode(evs)
+	sendJSON(w, evs)
 }
 
-func (s *apiSvc) getSystemUpgrade(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	if noUpgrade {
 		http.Error(w, upgrade.ErrUpgradeUnsupported.Error(), 500)
 		return
@@ -872,38 +860,36 @@ func (s *apiSvc) getSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	res["newer"] = upgrade.CompareVersions(rel.Tag, Version) == upgrade.Newer
 	res["majorNewer"] = upgrade.CompareVersions(rel.Tag, Version) == upgrade.MajorNewer
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(res)
+	sendJSON(w, res)
 }
 
-func (s *apiSvc) getDeviceID(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getDeviceID(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	idStr := qs.Get("id")
 	id, err := protocol.DeviceIDFromString(idStr)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
 	if err == nil {
-		json.NewEncoder(w).Encode(map[string]string{
+		sendJSON(w, map[string]string{
 			"id": id.String(),
 		})
 	} else {
-		json.NewEncoder(w).Encode(map[string]string{
+		sendJSON(w, map[string]string{
 			"error": err.Error(),
 		})
 	}
 }
 
-func (s *apiSvc) getLang(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getLang(w http.ResponseWriter, r *http.Request) {
 	lang := r.Header.Get("Accept-Language")
 	var langs []string
 	for _, l := range strings.Split(lang, ",") {
 		parts := strings.SplitN(l, ";", 2)
 		langs = append(langs, strings.ToLower(strings.TrimSpace(parts[0])))
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(langs)
+	sendJSON(w, langs)
 }
 
-func (s *apiSvc) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	rel, err := upgrade.LatestRelease(s.cfg.Options().ReleasesURL, Version)
 	if err != nil {
 		l.Warnln("getting latest release:", err)
@@ -925,7 +911,7 @@ func (s *apiSvc) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *apiSvc) postSystemPause(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemPause(w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	var deviceStr = qs.Get("device")
 
@@ -938,7 +924,7 @@ func (s *apiSvc) postSystemPause(w http.ResponseWriter, r *http.Request) {
 	s.model.PauseDevice(device)
 }
 
-func (s *apiSvc) postSystemResume(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postSystemResume(w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	var deviceStr = qs.Get("device")
 
@@ -951,7 +937,7 @@ func (s *apiSvc) postSystemResume(w http.ResponseWriter, r *http.Request) {
 	s.model.ResumeDevice(device)
 }
 
-func (s *apiSvc) postDBScan(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postDBScan(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
 	if folder != "" {
@@ -971,13 +957,13 @@ func (s *apiSvc) postDBScan(w http.ResponseWriter, r *http.Request) {
 		errors := s.model.ScanFolders()
 		if len(errors) > 0 {
 			http.Error(w, "Error scanning folders", 500)
-			json.NewEncoder(w).Encode(errors)
+			sendJSON(w, errors)
 			return
 		}
 	}
 }
 
-func (s *apiSvc) postDBPrio(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) postDBPrio(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
 	file := qs.Get("file")
@@ -985,7 +971,7 @@ func (s *apiSvc) postDBPrio(w http.ResponseWriter, r *http.Request) {
 	s.getDBNeed(w, r)
 }
 
-func (s *apiSvc) getQR(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getQR(w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	var text = qs.Get("text")
 	code, err := qr.Encode(text, qr.M)
@@ -998,7 +984,7 @@ func (s *apiSvc) getQR(w http.ResponseWriter, r *http.Request) {
 	w.Write(code.PNG())
 }
 
-func (s *apiSvc) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 	tot := map[string]float64{}
 	count := map[string]float64{}
 
@@ -1019,12 +1005,10 @@ func (s *apiSvc) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 		comp[device] = int(tot[device] / count[device])
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(comp)
+	sendJSON(w, comp)
 }
 
-func (s *apiSvc) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+func (s *apiService) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	current := qs.Get("current")
 	search, _ := osutil.ExpandTilde(current)
@@ -1043,12 +1027,16 @@ func (s *apiSvc) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	json.NewEncoder(w).Encode(ret)
+
+	sendJSON(w, ret)
 }
 
 type embeddedStatic struct {
-	assetDir string
-	assets   map[string][]byte
+	theme        string
+	lastModified time.Time
+	mut          sync.RWMutex
+	assetDir     string
+	assets       map[string][]byte
 }
 
 func (s embeddedStatic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1071,13 +1059,21 @@ func (s embeddedStatic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	bs, ok := s.assets[file]
+	s.mut.RLock()
+	theme := s.theme
+	modified := s.lastModified
+	s.mut.RUnlock()
+
+	bs, ok := s.assets[theme+"/"+file]
 	if !ok {
-		http.NotFound(w, r)
-		return
+		bs, ok = s.assets[config.DefaultTheme+"/"+file]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
 	}
 
-	if r.Header.Get("If-Modified-Since") == auto.AssetsBuildDate {
+	if modifiedSince, err := time.Parse(r.Header.Get("If-Modified-Since"), http.TimeFormat); err == nil && modified.Before(modifiedSince) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -1096,7 +1092,7 @@ func (s embeddedStatic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		gr.Close()
 	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(bs)))
-	w.Header().Set("Last-Modified", auto.AssetsBuildDate)
+	w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
 	w.Header().Set("Cache-Control", "public")
 
 	w.Write(bs)
@@ -1129,7 +1125,28 @@ func (s embeddedStatic) mimeTypeForFile(file string) string {
 	}
 }
 
-func (s *apiSvc) toNeedSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
+// VerifyConfiguration implements the config.Committer interface
+func (s *embeddedStatic) VerifyConfiguration(from, to config.Configuration) error {
+	return nil
+}
+
+// CommitConfiguration implements the config.Committer interface
+func (s *embeddedStatic) CommitConfiguration(from, to config.Configuration) bool {
+	s.mut.Lock()
+	if s.theme != to.GUI.Theme {
+		s.theme = to.GUI.Theme
+		s.lastModified = time.Now()
+	}
+	s.mut.Unlock()
+
+	return true
+}
+
+func (s *embeddedStatic) String() string {
+	return fmt.Sprintf("embeddedStatic@%p", s)
+}
+
+func (s *apiService) toNeedSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
 	res := make([]jsonDBFileInfo, len(fs))
 	for i, f := range fs {
 		res[i] = jsonDBFileInfo(f)
